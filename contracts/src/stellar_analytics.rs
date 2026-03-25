@@ -23,6 +23,7 @@ const TOTAL_PRIVACY_BUDGET_USED_KEY: &str = "TOTAL_PRIVACY_BUDGET_USED";
 const ACTIVE_ANALYSES_KEY: &str = "ACTIVE_ANALYSES";
 const IPFS_DATASETS_KEY: &str = "IPFS_DATASETS";
 const DATA_AVAILABILITY_KEY: &str = "DATA_AVAILABILITY";
+const CID_IMMUTABILITY_KEY: &str = "CID_IMMUTABILITY";
 
 // Constants
 const MAX_PRIVACY_BUDGET: i128 = 1000000000000000000; // 1e18 (1000 tokens)
@@ -77,6 +78,15 @@ pub struct DataAvailability {
     pub last_checked: u64,
     pub pin_count: u32,
     pub filecoin_deal_id: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[contracttype]
+pub struct CIDImmutability {
+    pub cid: String,
+    pub request_id: BytesN<32>,
+    pub immutable_since: u64,
+    pub dataset_hash: BytesN<32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -202,6 +212,12 @@ impl StellarAnalytics {
 
         // Check if dataset exists and is available
         Self::check_data_availability(env.clone(), ipfs_cid.clone())?;
+        
+        // Verify dataset is registered and get its info
+        let dataset_info = Self::get_dataset(env.clone(), ipfs_cid.clone())?;
+        if !dataset_info.pinned {
+            return Err(StellarAnalyticsError::DataNotAvailable);
+        }
 
         let privacy_levels: Map<String, PrivacyLevel> = env
             .storage()
@@ -332,6 +348,12 @@ impl StellarAnalytics {
         if request.cancelled {
             return Err(StellarAnalyticsError::RequestAlreadyCancelled);
         }
+
+        // Enforce CID immutability - verify CID is still available and unchanged
+        Self::check_data_availability(env.clone(), request.ipfs_cid.clone())?;
+        
+        // Mark CID as immutable for this analysis
+        Self::mark_cid_immutable(env.clone(), request.ipfs_cid.clone(), request_id.clone())?;
 
         if privacy_budget_used > request.privacy_budget {
             return Err(StellarAnalyticsError::BudgetExceeded);
@@ -838,5 +860,137 @@ impl StellarAnalytics {
         env.storage().instance().set(&symbol!("data_availability"), &availability_map);
 
         Ok(())
+    }
+
+    /// Mark a CID as immutable for a specific analysis
+    pub fn mark_cid_immutable(
+        env: Env,
+        cid: String,
+        request_id: BytesN<32>,
+    ) -> Result<(), StellarAnalyticsError> {
+        let request = Self::get_analysis_request(env.clone(), request_id.clone())?;
+        
+        let immutability_record = CIDImmutability {
+            cid: cid.clone(),
+            request_id,
+            immutable_since: env.ledger().timestamp(),
+            dataset_hash: request.dataset_hash,
+        };
+
+        let mut immutability_map: Map<String, CIDImmutability> = env
+            .storage()
+            .instance()
+            .get(&symbol!("cid_immutability"))
+            .unwrap_or_else(|| Map::new(&env));
+
+        immutability_map.set(cid, immutability_record);
+        env.storage().instance().set(&symbol!("cid_immutability"), &immutability_map);
+
+        Ok(())
+    }
+
+    /// Check if a CID is immutable
+    pub fn is_cid_immutable(env: Env, cid: String) -> Result<bool, StellarAnalyticsError> {
+        let immutability_map: Map<String, CIDImmutability> = env
+            .storage()
+            .instance()
+            .get(&symbol!("cid_immutability"))
+            .unwrap_or_else(|| Map::new(&env));
+
+        Ok(immutability_map.contains_key(cid))
+    }
+
+    /// Get immutability record for a CID
+    pub fn get_cid_immutability(env: Env, cid: String) -> Result<CIDImmutability, StellarAnalyticsError> {
+        let immutability_map: Map<String, CIDImmutability> = env
+            .storage()
+            .instance()
+            .get(&symbol!("cid_immutability"))
+            .unwrap_or_else(|| Map::new(&env));
+
+        immutability_map
+            .get(cid)
+            .ok_or(StellarAnalyticsError::DatasetNotFound)
+    }
+
+    /// Enhanced data availability check with Filecoin deal verification
+    pub fn check_data_availability_enhanced(env: Env, cid: String) -> Result<(), StellarAnalyticsError> {
+        let availability = Self::get_data_availability(env.clone(), cid.clone())?;
+        
+        // Check basic availability
+        if !availability.available {
+            return Err(StellarAnalyticsError::DataNotAvailable);
+        }
+
+        // Check if CID is pinned
+        if availability.pin_count == 0 {
+            return Err(StellarAnalyticsError::DataNotAvailable);
+        }
+
+        // Check if there's an active Filecoin deal (optional but preferred)
+        if availability.filecoin_deal_id.is_none() {
+            // Log warning but don't fail - Filecoin deals are optional
+            env.logs().add(&"Warning: No Filecoin deal found for CID".into());
+        }
+
+        Ok(())
+    }
+
+    /// Automated pinning service integration
+    pub fn auto_pin_dataset(env: Env, cid: String) -> Result<(), StellarAnalyticsError> {
+        // This would typically be called by an off-chain service
+        // that monitors new datasets and automatically pins them
+        
+        let caller = env.current_contract_address();
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&symbol!("admin"))
+            .ok_or(StellarAnalyticsError::NotAuthorizedOracle)?;
+
+        if caller != admin {
+            return Err(StellarAnalyticsError::NotAuthorizedOracle);
+        }
+
+        // Mark dataset as pinned
+        Self::pin_dataset(env, cid)
+    }
+
+    /// Hybrid key management - store key hash on-chain, key off-chain
+    pub fn store_decryption_key_hash(
+        env: Env,
+        cid: String,
+        key_hash: BytesN<32>,
+        key_metadata: String,
+    ) -> Result<(), StellarAnalyticsError> {
+        let mut datasets: Map<String, IPFSDataset> = env
+            .storage()
+            .instance()
+            .get(&symbol!("ipfs_datasets"))
+            .unwrap_or_else(|| Map::new(&env));
+
+        let mut dataset = datasets
+            .get(cid.clone())
+            .ok_or(StellarAnalyticsError::DatasetNotFound)?;
+
+        dataset.decryption_key_hash = Some(key_hash);
+        datasets.set(cid, dataset);
+        env.storage().instance().set(&symbol!("ipfs_datasets"), &datasets);
+
+        Ok(())
+    }
+
+    /// Verify decryption key hash matches stored hash
+    pub fn verify_decryption_key_hash(
+        env: Env,
+        cid: String,
+        provided_key_hash: BytesN<32>,
+    ) -> Result<bool, StellarAnalyticsError> {
+        let dataset = Self::get_dataset(env, cid)?;
+        
+        match dataset.decryption_key_hash {
+            Some(stored_hash) => Ok(stored_hash == provided_key_hash),
+            None => Err(StellarAnalyticsError::InvalidDecryptionKey),
+        }
     }
 }

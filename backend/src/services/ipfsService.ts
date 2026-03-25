@@ -246,23 +246,180 @@ class IPFSService {
   }
 
   /**
-   * Create data availability record
+   * Enhanced data availability check with Filecoin deal verification
    */
-  async createDataAvailabilityRecord(
-    cid: string,
-    filecoinDealId?: number
-  ): Promise<DataAvailability> {
-    const isAvailable = await this.checkAvailability(cid);
-    const pinInfo = await this.getPinInfo(cid);
-    const deals = await this.getFilecoinDeals(cid);
+  async checkDataAvailabilityEnhanced(cid: string): Promise<{
+    available: boolean;
+    pinned: boolean;
+    filecoinDeals: FilecoinDeal[];
+    pinCount: number;
+    lastChecked: number;
+    gatewayAccessible: boolean;
+  }> {
+    try {
+      // Check basic IPFS availability
+      const isAvailable = await this.checkAvailability(cid);
+      
+      // Check pin status
+      const pinInfo = await this.getPinInfo(cid);
+      const isPinned = !!pinInfo;
+      
+      // Check Filecoin deals
+      const filecoinDeals = await this.getFilecoinDeals(cid);
+      
+      // Check gateway accessibility
+      let gatewayAccessible = false;
+      try {
+        const response = await axios.head(this.getGatewayUrl(cid), { timeout: 5000 });
+        gatewayAccessible = response.status === 200;
+      } catch (error) {
+        gatewayAccessible = false;
+      }
+      
+      return {
+        available: isAvailable,
+        pinned: isPinned,
+        filecoinDeals,
+        pinCount: isPinned ? 1 : 0,
+        lastChecked: Date.now(),
+        gatewayAccessible
+      };
+    } catch (error) {
+      logger.error(`Enhanced availability check failed for CID ${cid}:`, error);
+      return {
+        available: false,
+        pinned: false,
+        filecoinDeals: [],
+        pinCount: 0,
+        lastChecked: Date.now(),
+        gatewayAccessible: false
+      };
+    }
+  }
 
-    return {
-      cid,
-      available: isAvailable,
-      lastChecked: Date.now(),
-      pinCount: pinInfo ? 1 : 0,
-      filecoinDealId: filecoinDealId || deals[0]?.dealId
+  /**
+   * Automated pinning service with retry logic
+   */
+  async autoPinWithRetry(cid: string, maxRetries: number = 3): Promise<{ success: boolean; attempts: number; error?: string }> {
+    let lastError: string = '';
+    
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        logger.info(`Auto-pinning attempt ${attempt}/${maxRetries} for CID: ${cid}`);
+        
+        // Check if already pinned
+        const pinInfo = await this.getPinInfo(cid);
+        if (pinInfo) {
+          logger.info(`CID ${cid} is already pinned`);
+          return { success: true, attempts: attempt };
+        }
+        
+        // Attempt to pin
+        await this.pinToPinata(cid, `auto-pinned-${Date.now()}`);
+        
+        // Verify pinning was successful
+        const verifyPin = await this.getPinInfo(cid);
+        if (verifyPin) {
+          logger.info(`Successfully auto-pinned CID: ${cid}`);
+          return { success: true, attempts: attempt };
+        }
+        
+        lastError = 'Pinning verification failed';
+      } catch (error) {
+        lastError = error instanceof Error ? error.message : 'Unknown error';
+        logger.warn(`Auto-pinning attempt ${attempt} failed for CID ${cid}:`, error);
+        
+        // Exponential backoff
+        if (attempt < maxRetries) {
+          await new Promise(resolve => setTimeout(resolve, Math.pow(2, attempt) * 1000));
+        }
+      }
+    }
+    
+    return { success: false, attempts: maxRetries, error: lastError };
+  }
+
+  /**
+   * Monitor and maintain data availability for multiple CIDs
+   */
+  async maintainDataAvailability(cids: string[]): Promise<{
+    maintained: string[];
+    failed: string[];
+    errors: { cid: string; error: string }[];
+  }> {
+    const results = {
+      maintained: [] as string[],
+      failed: [] as string[],
+      errors: [] as { cid: string; error: string }[]
     };
+    
+    // Process in parallel batches
+    const batchSize = 10;
+    for (let i = 0; i < cids.length; i += batchSize) {
+      const batch = cids.slice(i, i + batchSize);
+      
+      const batchResults = await Promise.allSettled(
+        batch.map(async (cid) => {
+          const availability = await this.checkDataAvailabilityEnhanced(cid);
+          
+          if (!availability.pinned) {
+            const pinResult = await this.autoPinWithRetry(cid);
+            if (!pinResult.success) {
+              throw new Error(pinResult.error || 'Auto-pinning failed');
+            }
+          }
+          
+          return { cid, availability };
+        })
+      );
+      
+      batchResults.forEach((result, index) => {
+        const cid = batch[index];
+        if (result.status === 'fulfilled') {
+          results.maintained.push(cid);
+        } else {
+          results.failed.push(cid);
+          results.errors.push({
+            cid,
+            error: result.reason instanceof Error ? result.reason.message : 'Unknown error'
+          });
+        }
+      });
+    }
+    
+    return results;
+  }
+
+  /**
+   * Create Filecoin deal for enhanced persistence
+   */
+  async createFilecoinDeal(cid: string, duration: number = 525600): Promise<{ dealId?: number; success: boolean; error?: string }> {
+    try {
+      const url = `${this.pinataBaseUrl}/deals/create`;
+      const response = await axios.post(url, {
+        cid,
+        duration,
+        providerFilter: [],
+        verifiedDeals: false
+      }, {
+        headers: {
+          'pinata_api_key': this.pinataApiKey,
+          'pinata_secret_api_key': this.pinataSecretKey,
+          'Content-Type': 'application/json'
+        }
+      });
+      
+      if (response.data && response.data.dealId) {
+        logger.info(`Filecoin deal created for CID ${cid}: ${response.data.dealId}`);
+        return { dealId: response.data.dealId, success: true };
+      }
+      
+      return { success: false, error: 'No deal ID returned from Pinata' };
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      logger.error(`Failed to create Filecoin deal for CID ${cid}:`, error);
+      return { success: false, error: errorMessage };
+    }
   }
 
   /**
@@ -278,6 +435,24 @@ class IPFSService {
         result.status === 'fulfilled'
       )
       .map(result => result.value);
+  }
+
+  /**
+   * Create data availability record (legacy method for compatibility)
+   */
+  async createDataAvailabilityRecord(
+    cid: string,
+    filecoinDealId?: number
+  ): Promise<DataAvailability> {
+    const enhanced = await this.checkDataAvailabilityEnhanced(cid);
+    
+    return {
+      cid,
+      available: enhanced.available,
+      lastChecked: enhanced.lastChecked,
+      pinCount: enhanced.pinCount,
+      filecoinDealId: filecoinDealId || enhanced.filecoinDeals[0]?.dealId
+    };
   }
 
   /**

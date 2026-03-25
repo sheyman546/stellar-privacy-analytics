@@ -246,12 +246,11 @@ router.get('/deals/:cid', [
 });
 
 /**
- * POST /api/ipfs/verify-key
- * Verify decryption key against stored hash
+ * GET /api/ipfs/availability/enhanced/:cid
+ * Enhanced data availability check with Filecoin deal verification
  */
-router.post('/verify-key', [
-  body('decryptionKey').notEmpty().withMessage('Decryption key is required'),
-  body('keyHash').notEmpty().withMessage('Key hash is required')
+router.get('/availability/enhanced/:cid', [
+  param('cid').notEmpty().withMessage('CID is required')
 ], async (req: Request, res: Response) => {
   try {
     const errors = validationResult(req);
@@ -259,16 +258,111 @@ router.post('/verify-key', [
       return res.status(400).json({ errors: errors.array() });
     }
 
-    const { decryptionKey, keyHash } = req.body;
+    const { cid } = req.params;
 
-    const isValid = ipfsService.verifyDecryptionKey(decryptionKey, keyHash);
+    const availability = await ipfsService.checkDataAvailabilityEnhanced(cid);
 
     res.json({
       success: true,
-      valid: isValid
+      availability,
+      gatewayUrl: ipfsService.getGatewayUrl(cid)
     });
   } catch (error) {
-    logger.error('Error verifying decryption key:', error);
+    logger.error('Error in enhanced availability check:', error);
+    res.status(500).json({ error: error instanceof Error ? error.message : 'Unknown error' });
+  }
+});
+
+/**
+ * POST /api/ipfs/auto-pin/:cid
+ * Automated pinning with retry logic
+ */
+router.post('/auto-pin/:cid', [
+  param('cid').notEmpty().withMessage('CID is required'),
+  body('maxRetries').optional().isInt({ min: 1, max: 10 })
+], async (req: Request, res: Response) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
+    const { cid } = req.params;
+    const { maxRetries = 3 } = req.body;
+
+    const result = await ipfsService.autoPinWithRetry(cid, maxRetries);
+
+    res.json({
+      success: result.success,
+      cid,
+      attempts: result.attempts,
+      error: result.error,
+      gatewayUrl: ipfsService.getGatewayUrl(cid)
+    });
+  } catch (error) {
+    logger.error('Error in auto-pinning:', error);
+    res.status(500).json({ error: error instanceof Error ? error.message : 'Unknown error' });
+  }
+});
+
+/**
+ * POST /api/ipfs/maintain-availability
+ * Monitor and maintain data availability for multiple CIDs
+ */
+router.post('/maintain-availability', [
+  body('cids').isArray({ min: 1 }).withMessage('CIDs array is required'),
+  body('cids.*').notEmpty().withMessage('Each CID must be non-empty')
+], async (req: Request, res: Response) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
+    const { cids } = req.body;
+
+    const results = await ipfsService.maintainDataAvailability(cids);
+
+    res.json({
+      success: true,
+      totalProcessed: cids.length,
+      maintained: results.maintained.length,
+      failed: results.failed.length,
+      results
+    });
+  } catch (error) {
+    logger.error('Error maintaining availability:', error);
+    res.status(500).json({ error: error instanceof Error ? error.message : 'Unknown error' });
+  }
+});
+
+/**
+ * POST /api/ipfs/filecoin-deal/:cid
+ * Create Filecoin deal for enhanced persistence
+ */
+router.post('/filecoin-deal/:cid', [
+  param('cid').notEmpty().withMessage('CID is required'),
+  body('duration').optional().isInt({ min: 1 })
+], async (req: Request, res: Response) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
+    const { cid } = req.params;
+    const { duration = 525600 } = req.body; // Default 1 year
+
+    const result = await ipfsService.createFilecoinDeal(cid, duration);
+
+    res.json({
+      success: result.success,
+      cid,
+      dealId: result.dealId,
+      error: result.error
+    });
+  } catch (error) {
+    logger.error('Error creating Filecoin deal:', error);
     res.status(500).json({ error: error instanceof Error ? error.message : 'Unknown error' });
   }
 });
